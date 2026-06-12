@@ -16,6 +16,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/iio/consumer.h>
@@ -36,25 +37,54 @@
 #define AXP813_CURR_LIMIT_REG_TO_UA(x)	\
 	((((x) & AXP813_CURR_LIMIT_MASK) + 3) * 500000)
 
+#define AXP20X_VBUS_IPSOUT_CURR_LIMIT_MASK	GENMASK(1, 0)
+#define AXP20X_VBUS_IPSOUT_CURR_LIMIT_MAX	GENMASK(1, 0)
+
 #define DRVNAME "axp20x-ac-power-supply"
 
 struct axp20x_ac_power {
+	struct device *dev;
 	struct regmap *regmap;
 	struct power_supply *supply;
 	struct iio_channel *acin_v;
 	struct iio_channel *acin_i;
 	bool has_acin_path_sel;
+	bool reset_vbus_ipsout_on_irq;
 	unsigned int num_irqs;
 	unsigned int irqs[] __counted_by(num_irqs);
 };
+
+static void axp20x_ac_power_reset_vbus_ipsout(struct axp20x_ac_power *power)
+{
+	int ret;
+
+	if (!power->reset_vbus_ipsout_on_irq)
+		return;
+
+	ret = regmap_update_bits(power->regmap, AXP20X_VBUS_IPSOUT_MGMT,
+				 AXP20X_VBUS_IPSOUT_CURR_LIMIT_MASK, 0);
+	if (ret)
+		goto err;
+
+	ret = regmap_update_bits(power->regmap, AXP20X_VBUS_IPSOUT_MGMT,
+				 AXP20X_VBUS_IPSOUT_CURR_LIMIT_MASK,
+				 AXP20X_VBUS_IPSOUT_CURR_LIMIT_MAX);
+	if (ret)
+		goto err;
+
+	return;
+
+err:
+	dev_warn_ratelimited(power->dev,
+			     "failed to reset VBUS IPSOUT current limit: %d\n",
+			     ret);
+}
 
 static irqreturn_t axp20x_ac_power_irq(int irq, void *devid)
 {
 	struct axp20x_ac_power *power = devid;
 
-	regmap_update_bits(power->regmap, AXP20X_VBUS_IPSOUT_MGMT, 0x03, 0x00);
-	regmap_update_bits(power->regmap, AXP20X_VBUS_IPSOUT_MGMT, 0x03, 0x03);
-
+	axp20x_ac_power_reset_vbus_ipsout(power);
 	power_supply_changed(power->supply);
 
 	return IRQ_HANDLED;
@@ -345,6 +375,8 @@ static int axp20x_ac_power_probe(struct platform_device *pdev)
 	if (!power)
 		return -ENOMEM;
 
+	power->dev = &pdev->dev;
+
 	if (axp_data->acin_adc) {
 		power->acin_v = devm_iio_channel_get(&pdev->dev, "acin_v");
 		if (IS_ERR(power->acin_v)) {
@@ -363,6 +395,9 @@ static int axp20x_ac_power_probe(struct platform_device *pdev)
 
 	power->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	power->has_acin_path_sel = axp_data->acin_path_sel;
+	power->reset_vbus_ipsout_on_irq =
+		device_property_read_bool(&pdev->dev,
+					  "x-powers,reset-vbus-ipsout-on-ac");
 	power->num_irqs = axp_data->num_irq_names;
 
 	platform_set_drvdata(pdev, power);

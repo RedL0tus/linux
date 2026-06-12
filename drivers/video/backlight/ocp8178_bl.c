@@ -7,62 +7,52 @@
  */
 
 #include <linux/backlight.h>
-#include <linux/err.h>
-#include <linux/fb.h>
-#include <linux/gpio.h> /* Only for legacy support */
-#include <linux/gpio/consumer.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_gpio.h>
-#include <linux/platform_data/gpio_backlight.h>
-#include <linux/platform_device.h>
-#include <linux/slab.h>
 #include <linux/delay.h>
-#include <linux/timer.h>
-#include <linux/poll.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/sched.h>
+#include <linux/fb.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
-#include <linux/irq.h>
-#include <linux/io.h>
-#include <linux/clk.h>
+#include <linux/minmax.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/property.h>
+#include <linux/slab.h>
 
 struct ocp8178_backlight {
 	struct device *dev;
 	struct device *fbdev;
 
 	struct gpio_desc *gpiod;
-	int def_value;
-	int current_value;
+	unsigned int def_value;
+	unsigned int current_value;
 };
 
-#define DETECT_DELAY 200
-#define DETECT_TIME 500
-#define DETECT_WINDOW_TIME 1000
-#define START_TIME 10
-#define END_TIME 10
-#define SHUTDOWN_TIME 3000
-#define LOW_BIT_HIGH_TIME 10
-#define LOW_BIT_LOW_TIME 50
-#define HIGH_BIT_HIGH_TIME 50
-#define HIGH_BIT_LOW_TIME 10
-#define MAX_BRIGHTNESS_VALUE 9
+#define OCP8178_DETECT_DELAY_US		200
+#define OCP8178_DETECT_TIME_US		500
+#define OCP8178_DETECT_WINDOW_TIME_US	1000
+#define OCP8178_START_TIME_US		10
+#define OCP8178_END_TIME_US		10
+#define OCP8178_SHUTDOWN_TIME_MS	3
+#define OCP8178_LOW_BIT_HIGH_TIME_US	10
+#define OCP8178_LOW_BIT_LOW_TIME_US	50
+#define OCP8178_HIGH_BIT_HIGH_TIME_US	50
+#define OCP8178_HIGH_BIT_LOW_TIME_US	10
+#define OCP8178_MAX_BRIGHTNESS		9
+#define OCP8178_DEFAULT_BRIGHTNESS	5
+#define OCP8178_DEVICE_ADDR		0x72
 
-static void entry_1wire_mode(struct ocp8178_backlight *gbl)
+static void ocp8178_enter_1wire_mode(struct ocp8178_backlight *gbl)
 {
-	unsigned long flags = 0;
+	unsigned long flags;
+
 	local_irq_save(flags);
 	gpiod_set_value(gbl->gpiod, 0);
-	mdelay(SHUTDOWN_TIME / 1000);
+	mdelay(OCP8178_SHUTDOWN_TIME_MS);
 	gpiod_set_value(gbl->gpiod, 1);
-	udelay(DETECT_DELAY);
+	udelay(OCP8178_DETECT_DELAY_US);
 	gpiod_set_value(gbl->gpiod, 0);
-	udelay(DETECT_TIME);
+	udelay(OCP8178_DETECT_TIME_US);
 	gpiod_set_value(gbl->gpiod, 1);
-	udelay(DETECT_WINDOW_TIME);
+	udelay(OCP8178_DETECT_WINDOW_TIME_US);
 	local_irq_restore(flags);
 }
 
@@ -70,58 +60,56 @@ static inline void write_bit(struct ocp8178_backlight *gbl, int bit)
 {
 	if (bit) {
 		gpiod_set_value(gbl->gpiod, 0);
-		udelay(HIGH_BIT_LOW_TIME);
+		udelay(OCP8178_HIGH_BIT_LOW_TIME_US);
 		gpiod_set_value(gbl->gpiod, 1);
-		udelay(HIGH_BIT_HIGH_TIME);
+		udelay(OCP8178_HIGH_BIT_HIGH_TIME_US);
 	} else {
 		gpiod_set_value(gbl->gpiod, 0);
-		udelay(LOW_BIT_LOW_TIME);
+		udelay(OCP8178_LOW_BIT_LOW_TIME_US);
 		gpiod_set_value(gbl->gpiod, 1);
-		udelay(LOW_BIT_HIGH_TIME);
+		udelay(OCP8178_LOW_BIT_HIGH_TIME_US);
 	}
 }
 
-static void write_byte(struct ocp8178_backlight *gbl, int byte)
+static void ocp8178_write_byte(struct ocp8178_backlight *gbl, u8 byte)
 {
-	unsigned long flags = 0;
-	unsigned char data = 0x72;
+	unsigned long flags;
+	u8 data = OCP8178_DEVICE_ADDR;
 	int i;
 
 	local_irq_save(flags);
 
 	gpiod_set_value(gbl->gpiod, 1);
-	udelay(START_TIME);
+	udelay(OCP8178_START_TIME_US);
 	for (i = 0; i < 8; i++) {
-		if (data & 0x80) {
+		if (data & 0x80)
 			write_bit(gbl, 1);
-		} else {
+		else
 			write_bit(gbl, 0);
-		}
 		data <<= 1;
 	}
 	gpiod_set_value(gbl->gpiod, 0);
-	udelay(END_TIME);
+	udelay(OCP8178_END_TIME_US);
 
 	data = byte & 0x1f;
 
 	gpiod_set_value(gbl->gpiod, 1);
-	udelay(START_TIME);
+	udelay(OCP8178_START_TIME_US);
 	for (i = 0; i < 8; i++) {
-		if (data & 0x80) {
+		if (data & 0x80)
 			write_bit(gbl, 1);
-		} else {
+		else
 			write_bit(gbl, 0);
-		}
 		data <<= 1;
 	}
 	gpiod_set_value(gbl->gpiod, 0);
-	udelay(END_TIME);
+	udelay(OCP8178_END_TIME_US);
 	gpiod_set_value(gbl->gpiod, 1);
 
 	local_irq_restore(flags);
 }
 
-unsigned char ocp8178_bl_table[MAX_BRIGHTNESS_VALUE + 1] = {
+static const u8 ocp8178_bl_table[OCP8178_MAX_BRIGHTNESS + 1] = {
 	0, 1, 4, 8, 12, 16, 20, 24, 28, 31
 };
 
@@ -134,12 +122,11 @@ static int ocp8178_update_status(struct backlight_device *bl)
 	    bl->props.state & (BL_CORE_SUSPENDED | BL_CORE_FBBLANK))
 		brightness = 0;
 
-	if (brightness > MAX_BRIGHTNESS_VALUE)
-		brightness = MAX_BRIGHTNESS_VALUE;
+	brightness = clamp_t(int, brightness, 0, OCP8178_MAX_BRIGHTNESS);
 
 	for (i = 0; i < 2; i++) {
-		entry_1wire_mode(gbl);
-		write_byte(gbl, ocp8178_bl_table[brightness]);
+		ocp8178_enter_1wire_mode(gbl);
+		ocp8178_write_byte(gbl, ocp8178_bl_table[brightness]);
 	}
 	gbl->current_value = brightness;
 
@@ -170,16 +157,12 @@ static int ocp8178_probe_dt(struct platform_device *pdev,
 			    struct ocp8178_backlight *gbl)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *np = dev->of_node;
 	enum gpiod_flags flags;
 	int ret = 0;
-	u32 value32;
+	u32 value32 = OCP8178_DEFAULT_BRIGHTNESS;
 
-	of_property_read_u32(np, "default-brightness", &value32);
-	if (value32 > MAX_BRIGHTNESS_VALUE)
-		gbl->def_value = MAX_BRIGHTNESS_VALUE;
-	else
-		gbl->def_value = value32;
+	device_property_read_u32(dev, "default-brightness", &value32);
+	gbl->def_value = min_t(u32, value32, OCP8178_MAX_BRIGHTNESS);
 	flags = gbl->def_value ? GPIOD_OUT_HIGH : GPIOD_OUT_LOW;
 
 	gbl->gpiod = devm_gpiod_get(dev, "backlight-control", flags);
@@ -195,24 +178,18 @@ static int ocp8178_probe_dt(struct platform_device *pdev,
 	return ret;
 }
 
-static struct backlight_device *backlight;
-
 static int ocp8178_probe(struct platform_device *pdev)
 {
 	struct backlight_properties props;
 	struct backlight_device *bl;
 	struct ocp8178_backlight *gbl;
-	struct device_node *np = pdev->dev.of_node;
 	int ret;
 
-	if (!np) {
-		dev_err(&pdev->dev,
-			"failed to find platform data or device tree node.\n");
+	if (!pdev->dev.of_node)
 		return -ENODEV;
-	}
 
 	gbl = devm_kzalloc(&pdev->dev, sizeof(*gbl), GFP_KERNEL);
-	if (gbl == NULL)
+	if (!gbl)
 		return -ENOMEM;
 
 	gbl->dev = &pdev->dev;
@@ -225,7 +202,7 @@ static int ocp8178_probe(struct platform_device *pdev)
 
 	memset(&props, 0, sizeof(props));
 	props.type = BACKLIGHT_RAW;
-	props.max_brightness = MAX_BRIGHTNESS_VALUE;
+	props.max_brightness = OCP8178_MAX_BRIGHTNESS;
 	bl = devm_backlight_device_register(&pdev->dev, dev_name(&pdev->dev),
 					    &pdev->dev, gbl,
 					    &ocp8178_backlight_ops, &props);
@@ -234,24 +211,11 @@ static int ocp8178_probe(struct platform_device *pdev)
 		return PTR_ERR(bl);
 	}
 
-	//	entry_1wire_mode(gbl);
-
 	bl->props.brightness = gbl->def_value;
 	backlight_update_status(bl);
 
 	platform_set_drvdata(pdev, bl);
 
-	backlight = bl;
-	return 0;
-}
-
-static int ocp8178_suspend(struct platform_device *pdev, pm_message_t state)
-{
-	return 0;
-}
-
-static int ocp8178_resume(struct platform_device *pdev)
-{
 	return 0;
 }
 
@@ -268,8 +232,6 @@ static struct platform_driver ocp8178_driver = {
 		.of_match_table = of_match_ptr(ocp8178_of_match),
 	},
 	.probe		= ocp8178_probe,
-	.suspend		= ocp8178_suspend,
-	.resume		= ocp8178_resume,
 };
 
 module_platform_driver(ocp8178_driver);

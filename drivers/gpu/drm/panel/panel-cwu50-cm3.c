@@ -16,9 +16,6 @@
 #include <linux/module.h>
 #include <video/mipi_display.h>
 
-static int power_off_case = 1;
-module_param(power_off_case,int,0660);
-
 struct cwu50 {
 	struct device *dev;
 	struct drm_panel panel;
@@ -26,31 +23,7 @@ struct cwu50 {
 	struct regulator *iovcc;
 	struct gpio_desc *reset_gpio;
 	enum drm_panel_orientation orientation;
-	int dsi_status; // 0: ok, 1: error
-	bool sysfs_node_created;
-};
-
-static ssize_t dsi_state_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(dev);
-	struct cwu50 *ctx = mipi_dsi_get_drvdata(dsi);
-
-	if (!ctx->dsi_status)
-		return scnprintf(buf, PAGE_SIZE, "ok\n");
-	else
-		return scnprintf(buf, PAGE_SIZE, "error\n");
-}
-
-static DEVICE_ATTR(dsi_state, 0444, dsi_state_show, NULL);
-
-static struct attribute *dsi_state_attrs[] = {
-	&dev_attr_dsi_state.attr,
-	NULL
-};
-
-static const struct attribute_group dsi_attr_group = {
-	.attrs = dsi_state_attrs,
+	bool prepared;
 };
 
 static const struct drm_display_mode default_mode = {
@@ -312,56 +285,17 @@ static int cwu50_init_sequence(struct cwu50 *ctx)
 static int cwu50_unprepare(struct drm_panel *panel)
 {
 	struct cwu50 *ctx = panel_to_cwu50(panel);
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-	int err;
 
-	/* Power off the display using case 1 described in JD9365D.pdf chapter 9.5.3.
-	 * module's default behaviour
-	 */
-	if (1 == power_off_case) {
-		goto power_off_case1;
-	}
+	if (!ctx->prepared)
+		return 0;
 
-	/* Power off the display using case 2 described in JD9365D.pdf chapter 9.5.3. */
-
-	/* tCMD_OFF >= 1ms */
-	msleep(1);
-
-	err = mipi_dsi_dcs_set_display_off(dsi);
-	if (err) {
-		dev_warn(ctx->dev, "failed to send display off command (%d)\n", err);
-		goto fallback_case1;
-	}
-
-	/* tDISOFF >= 50ms */
-	msleep(50);
-
-
-	err = mipi_dsi_dcs_enter_sleep_mode(dsi);
-	if (err) {
-		dev_warn(ctx->dev, "failed to enter sleep mode (%d)\n", err);
-		goto fallback_case1;
-	}
-
-	/* tSLPIN >= 100ms */
-	msleep(100);
-
-
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1); /* assert reset */
-
-	goto disable_regulators;
-
-fallback_case1:
-	/* in case of error, fall back to case 1 */
-	dev_warn(ctx->dev, "falling back to power off case 1 using HW reset line");
-power_off_case1:
-	gpiod_set_value_cansleep(ctx->reset_gpio, 1); /* assert reset */
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	/* tRSTOFF1 >= 120ms */
 	msleep(120);
 
-disable_regulators:
 	regulator_disable(ctx->vci);
 	regulator_disable(ctx->iovcc);
+	ctx->prepared = false;
 
 	return 0;
 }
@@ -371,7 +305,9 @@ static int cwu50_prepare(struct drm_panel *panel)
 	struct cwu50 *ctx = panel_to_cwu50(panel);
 	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
 	int err;
-	u8 response;
+
+	if (ctx->prepared)
+		return 0;
 
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1); /* ensure asserted state */
 
@@ -438,13 +374,7 @@ static int cwu50_prepare(struct drm_panel *panel)
 		goto disable_vci;
 	}
 
-	err = mipi_dsi_dcs_get_power_mode(dsi, &response);
-	if (!err) {
-		/* debug, normally the command will fail */
-		dev_info(ctx->dev, "Read display power mode got: %d", response);
-	}
-
-	ctx->dsi_status = 0;  // ok
+	ctx->prepared = true;
 
 	return 0;
 disable_vci:
@@ -453,7 +383,6 @@ disable_iovcc:
 	regulator_disable(ctx->iovcc);
 error_finialize:
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
-	ctx->dsi_status = 1;
 	return err;
 }
 
@@ -515,7 +444,7 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 					  MIPI_DSI_MODE_VIDEO_BURST |
 					  MIPI_DSI_MODE_VIDEO_SYNC_PULSE;
 
-	ctx->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+	ctx->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ctx->reset_gpio)) {
 		err = PTR_ERR(ctx->reset_gpio);
 		return dev_err_probe(dev, err, "Failed to request GPIO (%d)\n", err);
@@ -556,23 +485,12 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 		return err;
 	}
 
-	err = sysfs_create_group(&dsi->dev.kobj, &dsi_attr_group);
-	if (err < 0) {
-		dev_warn(dev, "Cannot create optional sysfs nodes: %d\n", err);
-	} else {
-		ctx->sysfs_node_created = true;
-	}
-
 	return 0;
 }
 
 static void cwu50_remove(struct mipi_dsi_device *dsi)
 {
 	struct cwu50 *ctx = mipi_dsi_get_drvdata(dsi);
-
-	if (ctx->sysfs_node_created) {
-		sysfs_remove_group(&dsi->dev.kobj, &dsi_attr_group);
-	}
 
 	mipi_dsi_detach(dsi);
 	drm_panel_remove(&ctx->panel);

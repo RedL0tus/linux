@@ -47,9 +47,12 @@
 
 			battery: battery@0 {
 				compatible = "simple-battery";
+				device-chemistry = "lithium-ion";
 				constant-charge-current-max-microamp = <2100000>;
 				voltage-min-design-microvolt = <3300000>;
 				voltage-max-design-microvolt = <4200000>;
+				energy-full-design-microwatt-hours = <24790000>;
+				charge-full-design-microamp-hours = <6700000>;
 			};
 
 			/* TPS61178, the supply for 5V bus, including USB, backlight
@@ -316,10 +319,12 @@
 				battery_power_supply: battery-power-supply {
 					compatible = "x-powers,axp221-battery-power-supply";
 					monitored-battery = <&battery>;
+					x-powers,set-fuel-gauge-design-capacity;
 				};
 
 				ac_power_supply: ac_power_supply {
 					compatible = "x-powers,axp221-ac-power-supply";
+					x-powers,reset-vbus-ipsout-on-ac;
 				};
 
 				axp_adc: adc {

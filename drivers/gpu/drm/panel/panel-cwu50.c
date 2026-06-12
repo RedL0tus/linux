@@ -258,15 +258,15 @@ static void cwu50_init_sequence(struct cwu50 *ctx)
 	dcs_write_seq(0x7E,0x7B);
 	dcs_write_seq(0xE0,0x04);
 	dcs_write_seq(0x09,0x10);
-	dcs_write_seq(0xE0,0x00);
+	dcs_write_seq(0xE0, 0x00);
 	dcs_write_seq(0xE6,0x02);
 	dcs_write_seq(0xE7,0x02);
 }
 static int cwu50_init_sequence2(struct cwu50 *ctx)
 {
 	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-	int err;
-	dcs_write_seq(0xE0,0x00);
+
+	dcs_write_seq(0xE0, 0x00);
 
 	//--- PASSWORD	----//
 	dcs_write_seq(0xE1,0x93);
@@ -533,8 +533,6 @@ static int cwu50_init_sequence2(struct cwu50 *ctx)
 static int cwu50_disable(struct drm_panel *panel)
 {
 	struct cwu50 *ctx = panel_to_cwu50(panel);
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-	int ret;
 
 	if (!ctx->enabled)
 		return 0;
@@ -585,7 +583,7 @@ static int cwu50_prepare(struct drm_panel *panel)
 	struct cwu50 *ctx = panel_to_cwu50(panel);
 	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
 	int ret;
-	u8 buf[4];
+	u8 buf[3] = {};
 
 	if (ctx->prepared)
 		return 0;
@@ -634,11 +632,12 @@ static int cwu50_prepare(struct drm_panel *panel)
 	}
 	/* Exit sleep mode and power on */
 	dcs_write_seq(0x11);// SLPOUT
-        msleep(120);
-        dcs_write_seq(0xE0,0x00);
-        mipi_dsi_dcs_read(dsi, 0x04, buf, 3);
+	msleep(120);
+	dcs_write_seq(0xE0, 0x00);
+	ret = mipi_dsi_dcs_read(dsi, 0x04, buf, sizeof(buf));
 
-        if(buf[0] == 0x39) ctx->is_new_panel = 1;
+	if (ret >= 1 && buf[0] == 0x39)
+		ctx->is_new_panel = true;
 
 	if (ctx->is_new_panel)
 		cwu50_init_sequence2(ctx);
@@ -667,8 +666,6 @@ static int cwu50_prepare(struct drm_panel *panel)
 static int cwu50_enable(struct drm_panel *panel)
 {
 	struct cwu50 *ctx = panel_to_cwu50(panel);
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
-	int ret;
 
 	if (ctx->enabled)
 		return 0;

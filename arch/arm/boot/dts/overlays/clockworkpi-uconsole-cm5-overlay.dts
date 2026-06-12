@@ -90,9 +90,11 @@
 				battery_power_supply: battery-power-supply {
 					compatible = "x-powers,axp221-battery-power-supply";
 					monitored-battery = <&battery>;
+					x-powers,set-fuel-gauge-design-capacity;
 				};
 				ac_power_supply: ac_power_supply {
 					compatible = "x-powers,axp221-ac-power-supply";
+					x-powers,reset-vbus-ipsout-on-ac;
 				};
 				usb_power_supply: usb-power {
 					compatible = "x-powers,axp223-usb-power-supply";
