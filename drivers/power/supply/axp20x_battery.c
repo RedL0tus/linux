@@ -86,6 +86,8 @@
 #define AXP20X_CC_CTRL_CALIBRATE_MASK	GENMASK(5, 4)
 
 #define AXP20X_FG_DES_CAP_VALID		BIT(7)
+#define AXP20X_FG_DES_CAP1_REG		0xe0
+#define AXP20X_FG_DES_CAP0_REG		0xe1
 #define AXP20X_FG_DES_CAP_STEP_UAH	1456
 #define AXP20X_FG_DES_CAP_MAX		GENMASK(14, 0)
 
@@ -1060,11 +1062,61 @@ static void axp209_set_battery_info(struct platform_device *pdev,
 	}
 }
 
+static int axp20x_read_fuel_gauge_design_cap(struct axp20x_batt_ps *axp_batt,
+					     unsigned int *cap)
+{
+	unsigned int high, low;
+	int ret;
+
+	ret = regmap_read(axp_batt->regmap, AXP20X_FG_DES_CAP1_REG, &high);
+	if (ret)
+		return ret;
+
+	ret = regmap_read(axp_batt->regmap, AXP20X_FG_DES_CAP0_REG, &low);
+	if (ret)
+		return ret;
+
+	if (!(high & AXP20X_FG_DES_CAP_VALID))
+		return -ENODATA;
+
+	*cap = ((high & GENMASK(6, 0)) << 8) | low;
+
+	return 0;
+}
+
+static void axp20x_calibrate_fuel_gauge(struct platform_device *pdev,
+					struct axp20x_batt_ps *axp_batt)
+{
+	unsigned int reg;
+	int ret;
+
+	ret = regmap_read(axp_batt->regmap, AXP20X_FG_RES, &reg);
+	if (ret) {
+		dev_warn(&pdev->dev,
+			 "failed to read fuel gauge percentage before calibration: %d\n",
+			 ret);
+		return;
+	}
+
+	if (!axp_batt->data->has_fg_valid || reg & AXP22X_FG_VALID) {
+		if (reg & AXP209_FG_PERCENT)
+			return;
+	}
+
+	ret = regmap_update_bits(axp_batt->regmap, AXP20X_CC_CTRL,
+				 AXP20X_CC_CTRL_CALIBRATE_MASK,
+				 AXP20X_CC_CTRL_CALIBRATE_ENABLE |
+				 AXP20X_CC_CTRL_CALIBRATE_START);
+	if (ret)
+		dev_warn(&pdev->dev,
+			 "failed to start fuel gauge calibration: %d\n", ret);
+}
+
 static void axp20x_set_fuel_gauge_design_cap(struct platform_device *pdev,
 					     struct axp20x_batt_ps *axp_batt,
 					     struct power_supply_battery_info *info)
 {
-	unsigned int cap;
+	unsigned int cap, old_cap;
 	int ret;
 
 	if (!device_property_read_bool(&pdev->dev,
@@ -1086,23 +1138,30 @@ static void axp20x_set_fuel_gauge_design_cap(struct platform_device *pdev,
 		cap = AXP20X_FG_DES_CAP_MAX;
 	}
 
-	ret = regmap_update_bits(axp_batt->regmap, AXP288_FG_DES_CAP0_REG,
-				 GENMASK(7, 0), cap & GENMASK(7, 0));
-	if (ret) {
-		dev_warn(&pdev->dev,
-			 "failed to write fuel gauge design capacity low byte: %d\n",
-			 ret);
-		return;
+	ret = axp20x_read_fuel_gauge_design_cap(axp_batt, &old_cap);
+	if (ret || old_cap != cap) {
+		ret = regmap_update_bits(axp_batt->regmap, AXP20X_FG_DES_CAP0_REG,
+					 GENMASK(7, 0), cap & GENMASK(7, 0));
+		if (ret) {
+			dev_warn(&pdev->dev,
+				 "failed to write fuel gauge design capacity low byte: %d\n",
+				 ret);
+			return;
+		}
+
+		ret = regmap_update_bits(axp_batt->regmap, AXP20X_FG_DES_CAP1_REG,
+					 GENMASK(7, 0),
+					 AXP20X_FG_DES_CAP_VALID |
+					 FIELD_GET(GENMASK(14, 8), cap));
+		if (ret) {
+			dev_warn(&pdev->dev,
+				 "failed to write fuel gauge design capacity high byte: %d\n",
+				 ret);
+			return;
+		}
 	}
 
-	ret = regmap_update_bits(axp_batt->regmap, AXP288_FG_DES_CAP1_REG,
-				 GENMASK(7, 0),
-				 AXP20X_FG_DES_CAP_VALID |
-				 FIELD_GET(GENMASK(14, 8), cap));
-	if (ret)
-		dev_warn(&pdev->dev,
-			 "failed to write fuel gauge design capacity high byte: %d\n",
-			 ret);
+	axp20x_calibrate_fuel_gauge(pdev, axp_batt);
 }
 
 static void axp717_set_battery_info(struct platform_device *pdev,
