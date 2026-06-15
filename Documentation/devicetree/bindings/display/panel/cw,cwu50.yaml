@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/panel/cw,cwu50.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: ClockworkPi CWU50 5-inch DSI panel
+
+maintainers:
+  - ClockworkPi
+
+allOf:
+  - $ref: panel-common.yaml#
+
+properties:
+  compatible:
+    enum:
+      - cw,cwu50
+      - clockwork,cwu50-cm3
+
+  reg:
+    maxItems: 1
+
+  vci-supply:
+    description: Core panel supply.
+
+  iovcc-supply:
+    description: I/O panel supply.
+
+  reset-gpios: true
+
+  backlight: true
+
+  rotation: true
+
+  port: true
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - backlight
+  - iovcc-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    dsi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        panel@0 {
+            compatible = "cw,cwu50";
+            reg = <0>;
+            reset-gpios = <&gpio 8 GPIO_ACTIVE_LOW>;
+            backlight = <&backlight>;
+            rotation = <90>;
+            vci-supply = <&panel_3v3>;
+            iovcc-supply = <&panel_1v8>;
+
+            port {
+                panel_in: endpoint {
+                    remote-endpoint = <&dsi_out>;
+                };
+            };
+        };
+    };
+
+...

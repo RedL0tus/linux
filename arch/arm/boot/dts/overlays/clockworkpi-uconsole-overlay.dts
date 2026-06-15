@@ -219,7 +219,7 @@
 			panel_cwu50: panel@0 {
 				compatible = "cw,cwu50";
 				reg = <0>;
-				reset-gpio = <&gpio 8 1>;
+				reset-gpios = <&gpio 8 1>;
 				backlight = <&ocp8178_backlight>;
 				rotation = <90>;
 				iovcc-supply = <&reg_aldo2>;

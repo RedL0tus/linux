@@ -166,7 +166,7 @@
 			panel_cwu50: panel@0 {
 				compatible = "cw,cwu50";
 				reg = <0>;
-				reset-gpio = <&rp1_gpio 8 1>; /* GPIO_ACTIVE_LOW */
+				reset-gpios = <&rp1_gpio 8 1>; /* GPIO_ACTIVE_LOW */
 				backlight = <&ocp8178_backlight>;
 				rotation = <90>;
 				vci-supply = <&reg_dcdc3>;

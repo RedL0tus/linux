@@ -3,25 +3,40 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_mipi_dsi.h>
 #include <drm/drm_panel.h>
-#include <linux/backlight.h>
 #include <linux/gpio/consumer.h>
 #include <linux/regulator/consumer.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/module.h>
+
+struct cwu50_desc {
+	bool detect_panel_type;
+};
 
 struct cwu50 {
 	struct device *dev;
 	struct drm_panel panel;
 	struct regulator *vci;
 	struct regulator *iovcc;
-	struct gpio_desc *id_gpio;
-	struct backlight_device *backlight;
+	struct gpio_desc *reset_gpio;
+	const struct cwu50_desc *desc;
 	bool prepared;
-	bool enabled;
+	bool reset_controllable;
 	bool is_new_panel;
+	bool vci_enabled;
+	bool iovcc_enabled;
 	enum drm_panel_orientation orientation;
 };
+
+#define CWU50_VCC_TO_LP11_MS		5
+#define CWU50_LP11_TO_RESET_MS		10
+#define CWU50_RESET_ASSERT_MS		10
+#define CWU50_RESET_DEASSERT_MS		5
+#define CWU50_RESET_TO_SLEEP_OUT_MS	120
+#define CWU50_SLEEP_IN_MS		120
+#define CWU50_SLEEP_OUT_MS		120
+#define CWU50_DISPLAY_ON_MS		20
 
 static const struct drm_display_mode default_mode = {
 	.clock = 61020,
@@ -33,6 +48,9 @@ static const struct drm_display_mode default_mode = {
 	.vsync_start = 1280 + 8,
 	.vsync_end = 1280 + 8+ 2,
 	.vtotal = 1280 + 8 + 2 + 16,
+	.width_mm = 63,
+	.height_mm = 110,
+	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
 };
 
 static inline struct cwu50 *panel_to_cwu50(struct drm_panel *panel)
@@ -40,15 +58,13 @@ static inline struct cwu50 *panel_to_cwu50(struct drm_panel *panel)
 	return container_of(panel, struct cwu50, panel);
 }
 
-#define dcs_write_seq(seq...)                              \
-({                                                              \
-	static const u8 d[] = { seq };                          \
-	mipi_dsi_dcs_write_buffer(dsi, d, ARRAY_SIZE(d));	 \
-})
+#define dcs_write_seq(seq...) mipi_dsi_dcs_write_seq_multi(&dsi_ctx, seq)
 
-static void cwu50_init_sequence(struct cwu50 *ctx)
+static int cwu50_init_sequence(struct cwu50 *ctx)
 {
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	struct mipi_dsi_multi_context dsi_ctx = {
+		.dsi = to_mipi_dsi_device(ctx->dev),
+	};
 
 	dcs_write_seq(0xE1,0x93);
 	dcs_write_seq(0xE2,0x65);
@@ -261,10 +277,15 @@ static void cwu50_init_sequence(struct cwu50 *ctx)
 	dcs_write_seq(0xE0, 0x00);
 	dcs_write_seq(0xE6,0x02);
 	dcs_write_seq(0xE7,0x02);
+
+	return dsi_ctx.accum_err;
 }
+
 static int cwu50_init_sequence2(struct cwu50 *ctx)
 {
-	struct mipi_dsi_device *dsi = to_mipi_dsi_device(ctx->dev);
+	struct mipi_dsi_multi_context dsi_ctx = {
+		.dsi = to_mipi_dsi_device(ctx->dev),
+	};
 
 	dcs_write_seq(0xE0, 0x00);
 
@@ -517,31 +538,68 @@ static int cwu50_init_sequence2(struct cwu50 *ctx)
 	//Page0
 	dcs_write_seq(0xE0,0x00);
 
-	dcs_write_seq(0x11);// SLPOUT
-	msleep (200);
-
-	dcs_write_seq(0x29);// DSiPON
-	msleep (100);
-
-
 	//--- TE----//
 	dcs_write_seq(0x35,0x00);
+
+	return dsi_ctx.accum_err;
+}
+
+static void cwu50_disable_regulators(struct cwu50 *ctx)
+{
+	if (ctx->vci_enabled) {
+		regulator_disable(ctx->vci);
+		ctx->vci_enabled = false;
+	}
+
+	if (ctx->iovcc_enabled) {
+		regulator_disable(ctx->iovcc);
+		ctx->iovcc_enabled = false;
+	}
+}
+
+static int cwu50_enable_regulators(struct cwu50 *ctx)
+{
+	int ret;
+
+	if (ctx->iovcc) {
+		ret = regulator_enable(ctx->iovcc);
+		if (ret) {
+			dev_err(ctx->dev, "failed to enable iovcc (%d)\n", ret);
+			return ret;
+		}
+		ctx->iovcc_enabled = true;
+	}
+
+	if (ctx->vci) {
+		ret = regulator_enable(ctx->vci);
+		if (ret) {
+			dev_err(ctx->dev, "failed to enable vci (%d)\n", ret);
+			cwu50_disable_regulators(ctx);
+			return ret;
+		}
+		ctx->vci_enabled = true;
+	}
 
 	return 0;
 }
 
-static int cwu50_disable(struct drm_panel *panel)
+static void cwu50_set_reset(struct cwu50 *ctx, int value)
 {
-	struct cwu50 *ctx = panel_to_cwu50(panel);
+	if (ctx->reset_controllable)
+		gpiod_set_value_cansleep(ctx->reset_gpio, value);
+}
 
-	if (!ctx->enabled)
-		return 0;
+static void cwu50_hw_reset(struct cwu50 *ctx)
+{
+	if (!ctx->reset_controllable)
+		return;
 
-	backlight_disable(ctx->backlight);
-
-	ctx->enabled = false;
-
-	return 0;
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	msleep(CWU50_RESET_DEASSERT_MS);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	msleep(CWU50_RESET_ASSERT_MS);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	msleep(CWU50_RESET_DEASSERT_MS);
 }
 
 static int cwu50_unprepare(struct drm_panel *panel)
@@ -564,14 +622,11 @@ static int cwu50_unprepare(struct drm_panel *panel)
 		dev_err(ctx->dev, "failed to enter sleep mode (%d)\n", ret);
 		return ret;
 	}
-	msleep(120);
+	msleep(CWU50_SLEEP_IN_MS);
 
-	if (!ctx->is_new_panel) {
-		/* Assert reset on RESX */
-		dev_info(ctx->dev, "asserting reset pin for old panel\n");
-		gpiod_set_value_cansleep(ctx->id_gpio, 1);
-		msleep(5);
-	}
+	cwu50_set_reset(ctx, 1);
+	msleep(CWU50_RESET_DEASSERT_MS);
+	cwu50_disable_regulators(ctx);
 
 	ctx->prepared = false;
 
@@ -588,93 +643,99 @@ static int cwu50_prepare(struct drm_panel *panel)
 	if (ctx->prepared)
 		return 0;
 
-	if (ctx->iovcc != NULL && ctx->vci != NULL) {
-		dev_info(ctx->dev, "regulator iovcc and vci defined, enabling\n");
+	cwu50_set_reset(ctx, 1);
 
-		/* IOVCC first, then VCI */
-		ret = regulator_enable(ctx->iovcc);
-		if (ret) {
-			dev_err(ctx->dev, "failed to enable iovcc (%d)\n", ret);
-			return ret;
-		}
-
-		/* tPWON>= 0ms */
-
-		/* MIPI should change to LP-11 after turning on vci according to JD9365D.pdf */
-		ret = regulator_enable(ctx->vci);
-		if (ret) {
-			dev_err(ctx->dev, "failed to enable vci (%d)\n", ret);
-			regulator_disable(ctx->iovcc);
-			return ret;
-		}
-
-		/* Wait for MIPI to initialize
-		 * tRPWIRES >= 5ms
-		 * 0 <= tMIPI_ON <= tRPWIRES
-		 */
-		msleep(5);
-	}
-
-	if (!ctx->is_new_panel) {
-		dev_info(ctx->dev, "old panel, cycling the reset pin\n");
-		/* Cycle RESX (Hardware Reset) */
-		gpiod_set_value_cansleep(ctx->id_gpio, 1);
-		msleep(10);
-		gpiod_set_value_cansleep(ctx->id_gpio, 0);
-		msleep(5);
-	}
-
-	/* Enabe tearing mode: send TE (tearing effect) at VBLANK */
-	ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
-	if (ret) {
-		dev_err(ctx->dev, "failed to enable vblank TE (%d)\n", ret);
+	ret = cwu50_enable_regulators(ctx);
+	if (ret)
 		return ret;
+
+	/*
+	 * The JD9365D power-on sequence requires the DSI lanes to be in LP-11
+	 * before reset is released. Sending NOP mirrors the in-tree
+	 * JD9365DA-H3 driver and forces the host out of high-speed video state.
+	 */
+	msleep(CWU50_VCC_TO_LP11_MS);
+
+	ret = mipi_dsi_dcs_nop(dsi);
+	if (ret) {
+		dev_err(ctx->dev, "failed to force LP-11 before reset (%d)\n", ret);
+		goto poweroff;
 	}
-	/* Exit sleep mode and power on */
-	dcs_write_seq(0x11);// SLPOUT
-	msleep(120);
-	dcs_write_seq(0xE0, 0x00);
-	ret = mipi_dsi_dcs_read(dsi, 0x04, buf, sizeof(buf));
 
-	if (ret >= 1 && buf[0] == 0x39)
-		ctx->is_new_panel = true;
+	msleep(CWU50_LP11_TO_RESET_MS);
 
-	if (ctx->is_new_panel)
-		cwu50_init_sequence2(ctx);
-	else
-		cwu50_init_sequence(ctx);
+	cwu50_hw_reset(ctx);
+
+	/*
+	 * JD9365D reset timing allows commands 5ms after RESX is released,
+	 * but Sleep Out must not be sent until 120ms after reset. Some regular
+	 * panel variants do not expose controllable RESX here, but the delay is
+	 * harmless and keeps cold boot timing conservative.
+	 */
+	msleep(CWU50_RESET_TO_SLEEP_OUT_MS);
+
+	if (ctx->desc->detect_panel_type) {
+		ret = mipi_dsi_dcs_set_tear_on(dsi, MIPI_DSI_DCS_TEAR_MODE_VBLANK);
+		if (ret) {
+			dev_err(ctx->dev, "failed to enable vblank TE (%d)\n", ret);
+			goto poweroff;
+		}
+
+		ret = mipi_dsi_dcs_write(dsi, 0xe0, (u8[]){ 0x00 }, 1);
+		if (ret < 0) {
+			dev_warn(ctx->dev, "failed to select ID command page (%d); keeping probed panel type\n",
+				 ret);
+		} else {
+			ret = mipi_dsi_dcs_read(dsi, 0x04, buf, sizeof(buf));
+			if (ret >= 1 && buf[0] == 0x39) {
+				ctx->is_new_panel = true;
+			} else if (ret < 0) {
+				dev_warn(ctx->dev, "failed to read panel ID (%d); keeping probed panel type\n",
+					 ret);
+			}
+		}
+
+		if (ctx->is_new_panel)
+			ret = cwu50_init_sequence2(ctx);
+		else
+			ret = cwu50_init_sequence(ctx);
+	} else {
+		ret = cwu50_init_sequence(ctx);
+	}
+	if (ret) {
+		dev_err(ctx->dev, "failed to send initialize sequence (%d)\n", ret);
+		goto poweroff;
+	}
 
 	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
 	if (ret) {
 		dev_err(ctx->dev, "failed to exit sleep mode (%d)\n", ret);
-		return ret;
+		goto poweroff;
 	}
-	msleep(120);
+	msleep(CWU50_SLEEP_OUT_MS);
 
 	ret = mipi_dsi_dcs_set_display_on(dsi);
 	if (ret) {
 		dev_err(ctx->dev, "failed to turn display on (%d)\n", ret);
-		return ret;
+		goto poweroff;
 	}
-	msleep(20);
+	msleep(CWU50_DISPLAY_ON_MS);
 
 	ctx->prepared = true;
 
 	return 0;
+
+poweroff:
+	cwu50_set_reset(ctx, 1);
+	cwu50_disable_regulators(ctx);
+	return ret;
 }
 
-static int cwu50_enable(struct drm_panel *panel)
+static enum drm_panel_orientation cwu50_get_orientation(struct drm_panel *panel)
 {
 	struct cwu50 *ctx = panel_to_cwu50(panel);
 
-	if (ctx->enabled)
-		return 0;
-
-	backlight_enable(ctx->backlight);
-
-	ctx->enabled = true;
-
-	return 0;
+	return ctx->orientation;
 }
 
 static int cwu50_get_modes(struct drm_panel *panel, struct drm_connector *connector)
@@ -702,11 +763,10 @@ static int cwu50_get_modes(struct drm_panel *panel, struct drm_connector *connec
 }
 
 static const struct drm_panel_funcs cwu50_drm_funcs = {
-	.disable = cwu50_disable,
 	.unprepare = cwu50_unprepare,
 	.prepare = cwu50_prepare,
-	.enable = cwu50_enable,
 	.get_modes = cwu50_get_modes,
+	.get_orientation = cwu50_get_orientation,
 };
 
 static int cwu50_probe(struct mipi_dsi_device *dsi)
@@ -721,45 +781,40 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 
 	mipi_dsi_set_drvdata(dsi, ctx);
 	ctx->dev = dev;
+	ctx->desc = of_device_get_match_data(dev);
 
 	dsi->lanes = 4;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST | MIPI_DSI_MODE_VIDEO_SYNC_PULSE;
 
-	ctx->id_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_IN);
-	if (IS_ERR(ctx->id_gpio)) {
-		ret = PTR_ERR(ctx->id_gpio);
-		if (ret != -EPROBE_DEFER)
-			dev_err(dev, "failed to request GPIO (%d)\n", ret);
-		return ret;
-	}
+	if (ctx->desc->detect_panel_type) {
+		ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_IN);
+		if (IS_ERR(ctx->reset_gpio))
+			return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
+					     "failed to request reset GPIO\n");
 
-	ctx->is_new_panel = gpiod_get_value_cansleep(ctx->id_gpio);
-	if (ctx->is_new_panel) {
-		dev_info(dev, "Detected new panel type\n");
-	} else {
-		dev_info(dev, "Detected old panel type\n");
-	}
-
-	/*
-	 * Switch the ID GPIO to OUTPUT for use with resetting,
-	 * only if we're using the old panel. The new panel's
-	 * ID (RESX) pin is always pulled down (or: asserted)
-	 * externally.
-	 */
-	if (!ctx->is_new_panel) {
-		dev_info(dev, "Old panel type, setting ID GPIO to OUTPUT for resetting\n");
-		ret = gpiod_direction_output(ctx->id_gpio, 0);
-
-		if (ret) {
-			dev_err(dev, "failed to set id_gpio to OUTPUT\n");
-			return ret;
+		ctx->is_new_panel = gpiod_get_value_cansleep(ctx->reset_gpio);
+		if (ctx->is_new_panel) {
+			dev_info(dev, "detected new panel type\n");
+		} else {
+			dev_info(dev, "detected old panel type\n");
+			ret = gpiod_direction_output(ctx->reset_gpio, 1);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "failed to switch reset GPIO to output\n");
+			ctx->reset_controllable = true;
 		}
+	} else {
+		ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
+		if (IS_ERR(ctx->reset_gpio))
+			return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
+					     "failed to request reset GPIO\n");
+		ctx->reset_controllable = true;
 	}
 
 	/*
-	 * Request vci and iovcc regulators when they are defined
-	 * Even though these regulartors may be always-on, we still need
+	 * Request vci and iovcc regulators when they are defined.
+	 * Even though these regulators may be always-on, we still need
 	 * to ensure that the panel only becomes ready _after_ them.
 	 * This is achieved by bubbling up EPROBE_DEFER from them.
 	 */
@@ -787,12 +842,6 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 		ctx->iovcc = NULL;
 	}
 
-	ctx->backlight = devm_of_find_backlight(dev);
-	if (IS_ERR(ctx->backlight)) {
-		dev_err(ctx->dev, "devm_of_find_backlight");
-		return PTR_ERR(ctx->backlight);
-	}
-
 	ret = of_drm_get_panel_orientation(dev->of_node, &ctx->orientation);
 	if (ret) {
 		dev_err(dev, "%pOF: failed to get orientation %d\n", dev->of_node, ret);
@@ -802,6 +851,10 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 	ctx->panel.prepare_prev_first = true;
 
 	drm_panel_init(&ctx->panel, dev, &cwu50_drm_funcs, DRM_MODE_CONNECTOR_DSI);
+
+	ret = drm_panel_of_backlight(&ctx->panel);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get backlight\n");
 
 	drm_panel_add(&ctx->panel);
 
@@ -815,6 +868,14 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 	return 0;
 }
 
+static const struct cwu50_desc cwu50_desc = {
+	.detect_panel_type = true,
+};
+
+static const struct cwu50_desc cwu50_cm3_desc = {
+	.detect_panel_type = false,
+};
+
 static void cwu50_remove(struct mipi_dsi_device *dsi)
 {
 	struct cwu50 *ctx = mipi_dsi_get_drvdata(dsi);
@@ -824,7 +885,8 @@ static void cwu50_remove(struct mipi_dsi_device *dsi)
 }
 
 static const struct of_device_id cwu50_of_match[] = {
-	{ .compatible = "cw,cwu50" },
+	{ .compatible = "cw,cwu50", .data = &cwu50_desc },
+	{ .compatible = "clockwork,cwu50-cm3", .data = &cwu50_cm3_desc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, cwu50_of_match);
