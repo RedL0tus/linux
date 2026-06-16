@@ -794,16 +794,16 @@ static int cwu50_probe(struct mipi_dsi_device *dsi)
 					     "failed to request reset GPIO\n");
 
 		ctx->is_new_panel = gpiod_get_value_cansleep(ctx->reset_gpio);
-		if (ctx->is_new_panel) {
+		if (ctx->is_new_panel)
 			dev_info(dev, "detected new panel type\n");
-		} else {
+		else
 			dev_info(dev, "detected old panel type\n");
-			ret = gpiod_direction_output(ctx->reset_gpio, 1);
-			if (ret)
-				return dev_err_probe(dev, ret,
-						     "failed to switch reset GPIO to output\n");
-			ctx->reset_controllable = true;
-		}
+
+		ret = gpiod_direction_output(ctx->reset_gpio, 1);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to switch reset GPIO to output\n");
+		ctx->reset_controllable = true;
 	} else {
 		ctx->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 		if (IS_ERR(ctx->reset_gpio))
